@@ -1,27 +1,11 @@
 """
 Serverless Flask API for processing diagnostic Excel data on Vercel.
-
-This module defines a small Flask application that accepts Excel files,
-normalises and calculates a number of derived metrics, and returns a new
-Excel workbook containing multiple sheets and charts.  It is intended to
-be deployed as a Vercel serverless function, so the file lives inside
-an `api` directory and is referenced by `vercel.json`.
-
-The code imports all of its runtime dependencies at the top level so
-Vercel knows to include them in the deployed package.  If a dependency
-is missing at runtime, the application will respond with a JSON error
-instead of an HTML page, which makes error handling in the client
-simpler.
+Improved version with KeyError protection.
 """
 
 from flask import Flask, request, send_file, jsonify, render_template_string
 import pandas as pd
-# The following imports are intentionally unused directly in the code but
-# required to ensure that Vercel bundles these optional engines.  Pandas
-# chooses the Excel writer engine automatically if it is available.  If
-# `openpyxl` or `xlsxwriter` are missing, pandas will raise an
-# ImportError when attempting to write files.  By importing them here
-# explicitly, they are included in the deployment bundle.
+# Импорты нужны, чтобы Vercel включил библиотеки в сборку
 import openpyxl  # noqa: F401  pylint: disable=unused-import
 import xlsxwriter  # noqa: F401  pylint: disable=unused-import
 import os
@@ -34,10 +18,9 @@ from werkzeug.utils import secure_filename  # noqa: F401
 # -----------------------------------------------------------------------------
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB upload limit
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB upload limit
 
-# Column mapping from raw column names to normalised names.  See project
-# documentation for details on the meaning of each field.
+# Column mapping
 COLUMN_MAPPING = {
     "ID": "ID",
     "Время создания": "Время",
@@ -99,7 +82,6 @@ def calc_lab(time, errors, reached, limit):
         errors = int(errors)
     except Exception:
         errors = 0
-    # If the child did not reach the goal explicitly mark as zero
     if isinstance(reached, str) and reached.strip() == "Нет":
         return 0
     if time > limit:
@@ -123,14 +105,13 @@ def attention_index(rings, errors):
         errors = float(errors)
     except Exception:
         errors = 0
-    # According to methodology: 0.5*rings - (2.8*errors)/60
     return 0.5 * rings - (2.8 * errors) / 60
 
 
 def categorize(value):
     """Map a continuous value onto a qualitative level description."""
     if pd.isna(value):
-        return None
+        return "ниже нормативного"
     if value < 0.33:
         return "ниже нормативного"
     elif value <= 0.66:
@@ -140,15 +121,13 @@ def categorize(value):
 
 
 def extract_town(org_name):
-    """Extract the town name from the organisation name in parentheses."""
     match = re.search(r"\((.*?)\)", str(org_name))
     if match:
         return match.group(1).split(";")[0].strip()
-    return None
+    return "Не указано"
 
 
 def sort_key_town(name):
-    """Return a sortable tuple to order Russian town names in a meaningful way."""
     if pd.isna(name):
         return (999, "")
     name = str(name).strip()
@@ -168,42 +147,48 @@ def sort_key_town(name):
 
 
 def process_excel(file_content: bytes, filename: str):
-    """
-    Main data processing routine.
-
-    Takes the raw bytes of an uploaded Excel file and its filename,
-    validates the name, cleans and normalises the data, calculates
-    additional metrics, builds intermediate tables and finally
-    constructs a multi-sheet Excel workbook in memory.  The workbook
-    includes charts for age distribution, medians and level counts.
-
-    :param file_content: Raw bytes of the uploaded Excel file.
-    :param filename: Name of the uploaded file.
-    :return: Tuple (binary Excel content, suggested filename).
-    :raises ValueError: If the filename does not match the expected pattern.
-    """
-    # Validate filename (e.g. "5-31-Razvitie.xlsx")
+    # Validate filename
     match = re.match(r'(\d+)-(\d+)', filename)
     if not match:
         raise ValueError("Неверный формат имени файла. Ожидается: {площадка}-{диагностика}-*.xlsx")
     ploshchadka = match.group(1)
     diagnostika = match.group(2)
 
-    # Read the first sheet of the Excel file
+    # Read Excel
     df = pd.read_excel(io.BytesIO(file_content), sheet_name=0)
-    # Normalise column names
+    
+    # Rename columns
     df = df.rename(columns=COLUMN_MAPPING)
 
-    # Derive labyrinth scores (П1–П5) using the appropriate time limits
+    # --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Заполняем отсутствующие колонки ---
+    # Это предотвращает KeyError, если в файле не хватает данных
+    required_cols = list(COLUMN_MAPPING.values())
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = 0
+    
+    # Превращаем числовые колонки в числа, ошибки -> 0
+    numeric_columns = [
+        "И5-1Время", "И5-1Ошиб", "И5-2Время", "И5-2Ошиб", 
+        "И5-3Время", "И5-3Ошиб", "И5-4Время", "И5-4Ошиб", "И5-5Время", "И5-5Ошиб",
+        "И3-1Кольца", "И3-1Ошиб", "И3-2Кольца", "И3-2Ошиб",
+        "И3-3Кольца", "И3-3Ошиб", "И3-4Кольца", "И3-4Ошиб", "И3-5Кольца", "И3-5Ошиб",
+        "И1-1Сум", "И2Сум", "И4Сум", 
+        "И1-2Связн", "И1-2РечОформ", "И1-2СамРасс",
+        "В1", "В2", "ЭмоцИдент", "Планир", "Сотруд", "Рефлек"
+    ]
+    for col in numeric_columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # Calculations
     df["П1"] = df.apply(lambda x: calc_lab(x.get("И5-1Время"), x.get("И5-1Ошиб"), x.get("И5-1Дошел"), 35), axis=1)
     df["П2"] = df.apply(lambda x: calc_lab(x.get("И5-2Время"), x.get("И5-2Ошиб"), x.get("И5-2Дошел"), 35), axis=1)
     df["П3"] = df.apply(lambda x: calc_lab(x.get("И5-3Время"), x.get("И5-3Ошиб"), x.get("И5-3Дошел"), 50), axis=1)
     df["П4"] = df.apply(lambda x: calc_lab(x.get("И5-4Время"), x.get("И5-4Ошиб"), x.get("И5-4Дошел"), 65), axis=1)
     df["П5"] = df.apply(lambda x: calc_lab(x.get("И5-5Время"), x.get("И5-5Ошиб"), x.get("И5-5Дошел"), 125), axis=1)
-    # Average labyrinth score mapped onto a 0–1 scale
     df["Аналит-Синт"] = ((df[["П1", "П2", "П3", "П4", "П5"]].mean(axis=1)) / 3).round(2)
 
-    # Attention indices for each minute and their mean
     df["Вним1"] = df.apply(lambda x: attention_index(x.get("И3-1Кольца"), x.get("И3-1Ошиб")), axis=1)
     df["Вним2"] = df.apply(lambda x: attention_index(x.get("И3-2Кольца"), x.get("И3-2Ошиб")), axis=1)
     df["Вним3"] = df.apply(lambda x: attention_index(x.get("И3-3Кольца"), x.get("И3-3Ошиб")), axis=1)
@@ -212,12 +197,10 @@ def process_excel(file_content: bytes, filename: str):
     df["СредВним"] = df[["Вним1", "Вним2", "Вним3", "Вним4", "Вним5"]].mean(axis=1)
     df["Качество внимания"] = df["СредВним"].apply(lambda v: 1 if v >= 6 else round(v / 6, 2))
 
-    # Normalise criterion scores to a 0–1 scale
     df["Связн"] = (df["И1-2Связн"] / 5).round(2)
     df["РечОформ"] = (df["И1-2РечОформ"] / 5).round(2)
     df["СамостРасс"] = (df["И1-2СамРасс"] / 5).round(2)
 
-    # Derived composite metrics
     df["Готовн_УД"] = ((df["И1-1Сум"] / 18 + (df["Связн"] + df["РечОформ"] + df["СамостРасс"]) / 3) / 2).round(2)
     df["Лог_обобщение"] = (df["И2Сум"] / 16).round(2)
     df["Перцепция"] = (df["И4Сум"] / 11).round(2)
@@ -232,13 +215,14 @@ def process_excel(file_content: bytes, filename: str):
     df["Воображение_итог"] = df["Воображение"]
     df["ЭмСоцИнтеллект"] = ((df["Идентиф_эмоций"] + (df["Планирование"] + df["Сотрудничество"] + df["Рефлексия"]) / 3) / 2).round(2)
 
-    # Qualitative level descriptors
     for col in ["Когнитивное развитие", "Воображение_итог", "ЭмСоцИнтеллект"]:
         df[col + "_уровень"] = df[col].apply(categorize)
 
-    # Prepare summary tables
+    # Tables & Excel Generation
     level_tables = {}
     total = len(df)
+    if total == 0: total = 1 # защита от деления на 0
+
     for metr in ["Когнитивное развитие", "Воображение_итог", "ЭмСоцИнтеллект"]:
         t = df[metr + "_уровень"].value_counts().reindex(
             ["ниже нормативного", "нормативный", "выше нормативного"], fill_value=0
@@ -253,13 +237,16 @@ def process_excel(file_content: bytes, filename: str):
         "Воображение", "ЭмСоцИнтеллект", "Идентиф_эмоций",
         "Планирование", "Сотрудничество", "Рефлексия"
     ]
-    median_table = df[cols_for_median].median().round(2).reset_index()
-    median_table.columns = ["Показатель", "Медианное значение"]
+    median_table = df[cols_for_median].median(numeric_only=True).round(2).reset_index()
+    if median_table.empty:
+         median_table = pd.DataFrame({"Показатель": cols_for_median, "Медианное значение": [0]*len(cols_for_median)})
+    else:
+        median_table.columns = ["Показатель", "Медианное значение"]
 
     age_counts = df["Возраст"].value_counts().reset_index()
     age_counts.columns = ["Возрастная группа", "Количество детей"]
     age_counts["Количество детей в %"] = (age_counts["Количество детей"] / age_counts["Количество детей"].sum())
-    # Attempt to sort age groups numerically when possible
+
     def extract_age(text):
         try:
             return int(str(text).split("-")[0].split()[0])
@@ -280,7 +267,6 @@ def process_excel(file_content: bytes, filename: str):
     })
     towns_with_total = pd.concat([towns, total_row], ignore_index=True)
 
-    # Export normalised per-child metrics
     df_export = pd.DataFrame({
         "Код": df["Код"],
         "Возраст": df["Возраст"],
@@ -302,80 +288,75 @@ def process_excel(file_content: bytes, filename: str):
         "Когнитивное развитие": df["Когнитивное развитие"],
         "ЭмСоцИнтеллект": df["ЭмСоцИнтеллект"],
         "Когнитивное развитие_уровень": df["Когнитивное развитие_уровень"],
-        # Rename "Воображение_итог_уровень" to user-friendly column name
         "Воображение_уровень": df["Воображение_итог_уровень"],
         "ЭмСоцИнтеллект_уровень": df["ЭмСоцИнтеллект_уровень"],
     })
 
-    # Build the Excel workbook in memory
+    # Build Excel
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         wb = writer.book
 
-        # Define some common formats
         fmt_header = wb.add_format({"bold": True, "bg_color": "#D9E1F2", "align": "center", "valign": "vcenter", "border": 1})
         fmt_num = wb.add_format({"num_format": "0.00", "align": "center"})
         fmt_pct = wb.add_format({"num_format": "0.0%", "align": "center"})
         fmt_text = wb.add_format({"align": "left"})
         bold_fmt = wb.add_format({"bold": True, "bg_color": "#D9E1F2", "align": "center", "valign": "vcenter", "border": 1})
 
-        # Sheet 1: Age distribution with pie chart
         age_counts.to_excel(writer, sheet_name="Возрастные группы", index=False)
         ws_age = writer.sheets["Возрастные группы"]
-        ch_age = wb.add_chart({"type": "pie"})
-        ch_age.add_series({
-            "name": "Возрастные группы",
-            "categories": ["Возрастные группы", 1, 0, len(age_counts), 0],
-            "values": ["Возрастные группы", 1, 1, len(age_counts), 1],
-            "data_labels": {"percentage": True, "category": True}
-        })
-        ch_age.set_title({"name": "Распределение детей по возрастным группам"})
-        ws_age.insert_chart("E2", ch_age, {"x_scale": 1.3, "y_scale": 1.3})
+        if len(age_counts) > 0:
+            ch_age = wb.add_chart({"type": "pie"})
+            ch_age.add_series({
+                "name": "Возрастные группы",
+                "categories": ["Возрастные группы", 1, 0, len(age_counts), 0],
+                "values": ["Возрастные группы", 1, 1, len(age_counts), 1],
+                "data_labels": {"percentage": True, "category": True}
+            })
+            ch_age.set_title({"name": "Распределение детей по возрастным группам"})
+            ws_age.insert_chart("E2", ch_age, {"x_scale": 1.3, "y_scale": 1.3})
 
-        # Sheet 2: Medians with radar chart
         median_table.to_excel(writer, sheet_name="Медианы", index=False)
         ws_median = writer.sheets["Медианы"]
-        ch_med = wb.add_chart({"type": "radar"})
-        ch_med.add_series({
-            "name": "Медианные значения",
-            "categories": ["Медианы", 1, 0, len(median_table), 0],
-            "values": ["Медианы", 1, 1, len(median_table), 1],
-            "marker": {"type": "circle", "size": 5},
-            "line": {"color": "#0070C0"},
-        })
-        ch_med.set_title({"name": "Медианные значения показателей"})
-        ws_median.insert_chart("E2", ch_med, {"x_scale": 1.5, "y_scale": 1.5})
+        if len(median_table) > 0:
+            ch_med = wb.add_chart({"type": "radar"})
+            ch_med.add_series({
+                "name": "Медианные значения",
+                "categories": ["Медианы", 1, 0, len(median_table), 0],
+                "values": ["Медианы", 1, 1, len(median_table), 1],
+                "marker": {"type": "circle", "size": 5},
+                "line": {"color": "#0070C0"},
+            })
+            ch_med.set_title({"name": "Медианные значения показателей"})
+            ws_median.insert_chart("E2", ch_med, {"x_scale": 1.5, "y_scale": 1.5})
 
-        # Sheets 3–5: Level distribution for each composite metric
         for metr in ["Когнитивное развитие", "Воображение_итог", "ЭмСоцИнтеллект"]:
             sh = metr.replace(" ", "_")[:30]
             table = level_tables[metr]
             table.to_excel(writer, sheet_name=sh, index=False)
             ws = writer.sheets[sh]
-            # Apply formatting on header
             for c, name in enumerate(table.columns):
                 ws.write(0, c, name, fmt_header)
             ws.set_column(0, 0, 20, fmt_text)
             ws.set_column(1, 1, 12, fmt_num)
             ws.set_column(2, 2, 12, fmt_pct)
-            ch = wb.add_chart({"type": "column"})
-            ch.add_series({
-                "name": metr,
-                "categories": [sh, 1, 0, 3, 0],
-                "values": [sh, 1, 2, 3, 2],
-                "data_labels": {"value": True}
-            })
-            ch.set_title({"name": f"Распределение уровней (%): {metr}"})
-            ch.set_y_axis({"num_format": "0%"})
-            ch.set_legend({"position": "bottom"})
-            ws.insert_chart("E2", ch, {"x_scale": 1.3, "y_scale": 1.3})
+            if len(table) > 0:
+                ch = wb.add_chart({"type": "column"})
+                ch.add_series({
+                    "name": metr,
+                    "categories": [sh, 1, 0, 3, 0],
+                    "values": [sh, 1, 2, 3, 2],
+                    "data_labels": {"value": True}
+                })
+                ch.set_title({"name": f"Распределение уровней (%): {metr}"})
+                ch.set_y_axis({"num_format": "0%"})
+                ch.set_legend({"position": "bottom"})
+                ws.insert_chart("E2", ch, {"x_scale": 1.3, "y_scale": 1.3})
 
-        # Sheet 6: Town summary with total row
         towns_with_total.to_excel(writer, sheet_name="Населённые пункты", index=False)
         ws_towns = writer.sheets["Населённые пункты"]
         ws_towns.set_row(len(towns_with_total), None, bold_fmt)
 
-        # Sheet 7: Normalised per-child metrics
         df_export.to_excel(writer, sheet_name="Нормированные_показатели", index=False)
         ws_norm = writer.sheets["Нормированные_показатели"]
         for c, name in enumerate(df_export.columns):
@@ -392,7 +373,6 @@ def process_excel(file_content: bytes, filename: str):
 
 @app.route('/')
 def index():
-    """Serve the minimal HTML upload interface."""
     html = '''<!DOCTYPE html>
     <html lang="ru">
     <head>
@@ -443,6 +423,7 @@ def index():
                 padding: 20px;
                 border-radius: 10px;
                 display: none;
+                word-wrap: break-word;
             }
             .status.success { background: #d4edda; color: #155724; }
             .status.error { background: #f8d7da; color: #721c24; }
@@ -468,8 +449,6 @@ def index():
                     <button type="button" class="btn" onclick="document.getElementById('fileInput').click()">
                         Выбрать файл
                     </button>
-                    <!-- Контейнер для отображения выбранного имени файла -->
-                    <p id="fileName" style="margin-top:10px; color:#333;"></p>
                 </div>
                 <div style="text-align: center; margin-top: 20px;">
                     <button type="submit" class="btn">Обработать</button>
@@ -486,22 +465,12 @@ def index():
             </div>
         </div>
         <script>
-            // Отображаем выбранное имя файла
-            const fileInput = document.getElementById('fileInput');
-            const fileNameLabel = document.getElementById('fileName');
-            fileInput.addEventListener('change', () => {
-                if (fileInput.files && fileInput.files.length > 0) {
-                    fileNameLabel.textContent = 'Выбран файл: ' + fileInput.files[0].name;
-                } else {
-                    fileNameLabel.textContent = '';
-                }
-            });
-
             document.getElementById('uploadForm').addEventListener('submit', async (e) => {
                 e.preventDefault();
                 const formData = new FormData();
+                const fileInput = document.getElementById('fileInput');
                 const status = document.getElementById('status');
-                if (!fileInput.files || !fileInput.files[0]) {
+                if (!fileInput.files[0]) {
                     status.textContent = '❌ Выберите файл';
                     status.className = 'status error';
                     status.style.display = 'block';
@@ -526,16 +495,13 @@ def index():
                         status.textContent = '✅ Готово! Файл скачан.';
                         status.className = 'status success';
                     } else {
-                        // Читаем тело ответа один раз и пытаемся распарсить его как JSON.
-                        const text = await response.text();
-                        let message = text || 'Неизвестная ошибка';
+                        let message;
                         try {
-                            const errObj = JSON.parse(text);
-                            if (errObj && errObj.error) {
-                                message = errObj.error;
-                            }
+                            const errJson = await response.json();
+                            message = errJson.error || 'Неизвестная ошибка';
                         } catch (err) {
-                            // ignore JSON parse errors
+                            const text = await response.text();
+                            message = text || 'Неизвестная ошибка';
                         }
                         status.textContent = '❌ ' + message;
                         status.className = 'status error';
@@ -553,7 +519,6 @@ def index():
 
 @app.route('/api/process', methods=['POST'])
 def process():
-    """Handle the file upload, process it and return a new Excel file."""
     try:
         if 'file' not in request.files:
             return jsonify({'error': 'Файл не найден'}), 400
@@ -568,14 +533,9 @@ def process():
             as_attachment=True,
             download_name=result_filename
         )
-        # Expose filename in custom header for the browser to use
         response.headers['X-Filename'] = result_filename
         return response
     except Exception as e:
-        # Return errors as JSON; Vercel will otherwise wrap exceptions in an HTML page.
         return jsonify({'error': str(e)}), 500
 
-
-# Bind the app instance for Vercel.  Vercel looks for a top-level variable
-# called `app` when using the @vercel/python runtime.
 app = app
